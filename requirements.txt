@@ -2,3 +2,5 @@ streamlit
 opencv-python-headless
 matplotlib
 numpy
+plotly          # ← 追加
+scikit-image    # ← 追加

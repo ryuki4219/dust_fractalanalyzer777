@@ -2,210 +2,164 @@ import streamlit as st
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from skimage import exposure
 from typing import Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
 
-st.set_page_config(page_title="フラクタル埃解析", layout="wide")
-st.title("📐 フラクタル次元による埃解析 Web アプリ")
+# ------------------------------- Streamlit config -----------------------------
+st.set_page_config(page_title="Dust Fractal Analyzer", layout="wide")
+st.title("🧹 フラクタル埃解析 — 4 指標×4 段階評価")
 
-# -----------------------------------------------------------------------------
-# 画像処理ユーティリティ
-# -----------------------------------------------------------------------------
+# -------------------------- 1. 画像処理ユーティリティ ------------------------
 
-def clahe_luminance(img_bgr: np.ndarray, clip: float = 2.0, tile: int = 8) -> np.ndarray:
-    """Lab 色空間の L チャンネルに CLAHE を適用し輝度のダイナミクスを拡張する。"""
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    L, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile))
-    L = clahe.apply(L)
-    lab_clahe = cv2.merge([L, a, b])
-    return cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
+def resize_if_large(img: np.ndarray, max_side: int = 1024) -> np.ndarray:
+    h, w = img.shape[:2]
+    scale = max(h, w) / max_side
+    if scale <= 1.0:
+        return img
+    return cv2.resize(img, (int(w / scale), int(h / scale)), interpolation=cv2.INTER_AREA)
 
 
-def gamma_correct(img_bgr: np.ndarray, gamma: float = 0.8) -> np.ndarray:
-    """シンプルなガンマ補正 (γ<1: 暗部持ち上げ, γ>1: 明部抑え)"""
-    inv_gamma = 1.0 / gamma
-    lut = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype("uint8")
-    return cv2.LUT(img_bgr, lut)
+def equalize_hist_uniformity(gray: np.ndarray) -> float:
+    """ヒストグラム均一度 (1 − 分散/最大分散)。0=不均一, 1=最均一"""
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).ravel()
+    hist /= hist.sum()
+    variance = ((np.arange(256) - hist.mean()) ** 2 * hist).sum()
+    max_var = (255 ** 2) / 4  # 2値分布時の最大分散
+    return 1.0 - variance / max_var
 
 
-def preprocess(
-    img_bgr: np.ndarray,
-    block: int = 11,
-    C: int = 2,
-    kernel_size: int = 3,
-    apply_clahe: bool = True,
-    gamma: float = 0.8,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """前処理: CLAHE→ガンマ→適応二値化→形態学開閉→Canny でエッジ抽出。
+def preprocess(img_bgr: np.ndarray, block: int, C: int, k: int) -> Tuple[np.ndarray, np.ndarray]:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    Returns
-    -------
-    edges : np.ndarray
-        ボックスカウント入力用のエッジ画像 (0/255)
-    clean : np.ndarray
-        採用前のクリーンな二値マスク (0/255)
-    sat_mask : np.ndarray
-        白飛び飽和領域マスク (True=飽和)
-    """
-    img = img_bgr.copy()
-
-    # 1) CLAHE (オプション)
-    if apply_clahe:
-        img = clahe_luminance(img)
-
-    # 2) ガンマ補正
-    if abs(gamma - 1.0) > 1e-3:
-        img = gamma_correct(img, gamma)
-
-    # 飽和マスク (灰度 250 以上)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    sat_mask = gray > 250
-
-    # 3) 適応二値化 (輝度成分のみ)
-    bin_adp = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block, C
-    )
-
-    # 4) 形態学的開閉で微小ノイズ除去 & 小粒連結
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    # 適応二値化 & 開閉でマスク生成
+    bin_adp = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                     cv2.THRESH_BINARY_INV, block, C)
+    kernel = np.ones((k, k), np.uint8)
     clean = cv2.morphologyEx(bin_adp, cv2.MORPH_OPEN, kernel, iterations=2)
 
-    # 5) Canny エッジ抽出
-    edges = cv2.Canny(clean, 50, 150)
+    # 粒子検出に備えラベリング
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(clean, connectivity=8)
+    areas = stats[1:, cv2.CC_STAT_AREA]  # 0番は背景
+    mean_size = areas.mean() if areas.size else 0.0
 
-    # 6) 飽和領域は解析対象外に
-    edges[sat_mask] = 0
-    clean[sat_mask] = 0
+    return clean, labels, mean_size
 
-    return edges, clean, sat_mask
-
-
-# -----------------------------------------------------------------------------
-# フラクタル解析ユーティリティ
-# -----------------------------------------------------------------------------
+# ---------------------- 2. フラクタル & 量計算ユーティリティ -----------------
 
 def box_count(img: np.ndarray, size: int) -> int:
-    """与えられたボックスサイズで非ゼロ領域を数える。"""
     S = np.add.reduceat(np.add.reduceat(img, np.arange(0, img.shape[0], size), axis=0),
                         np.arange(0, img.shape[1], size), axis=1)
     return np.count_nonzero(S)
 
 
-def evaluate_cleanliness(rate: float) -> str:
-    """空間占有率→簡易清潔度ラベル"""
-    if rate >= 10:
-        return "汚い"
-    elif rate >= 1:
-        return "やや汚い"
-    return "綺麗"
-
-
-def analyze_image(
-    image_bytes: bytes,
-    block: int,
-    C: int,
-    kernel_size: int,
-    apply_clahe: bool,
-    gamma: float,
-) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float], Optional[str], Optional[float], Optional[np.ndarray]]:
-    """画像バイト列を解析し結果を返す。失敗時はすべて None"""
-    file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
-    img_color = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    if img_color is None:
-        return (None,) * 6
-
-    edges, clean, sat_mask = preprocess(img_color, block, C, kernel_size, apply_clahe, gamma)
-
-    occupancy = np.count_nonzero(clean) / clean.size * 100
-    cleanliness = evaluate_cleanliness(occupancy)
-
-    # ボックスカウント (エッジのみ)
-    min_exp = 1  # 2px
-    max_exp = int(np.log2(min(edges.shape))) - 1
-    if max_exp <= min_exp:
-        return (None,) * 6
+def fractal_dimension(mask: np.ndarray) -> float:
+    min_exp = 1
+    max_exp = int(np.log2(min(mask.shape))) - 1
     sizes = 2 ** np.arange(min_exp, max_exp)
-    counts = [box_count(edges, s) for s in sizes]
-
-    # 線形回帰で勾配→フラクタル次元
+    counts = [box_count(mask, s) for s in sizes]
     coeffs = np.polyfit(np.log(sizes), np.log(counts), 1)
-    fractal_dim = -coeffs[0]
-
-    return img_color, edges, occupancy, cleanliness, fractal_dim, sat_mask
+    return -coeffs[0], sizes, counts
 
 
-# -----------------------------------------------------------------------------
-# Streamlit UI
-# -----------------------------------------------------------------------------
+def occupancy_rate(mask: np.ndarray) -> float:
+    return np.count_nonzero(mask) / mask.size * 100
+
+# -------------------------- 3. 総合評価ロジック -------------------------------
+
+LABELS = ["とても汚い", "やや汚い", "やや綺麗", "とても綺麗"]
+COLORS = ["#d62728", "#ff7f0e", "#1f77b4", "#2ca02c"]
+
+def score_to_label(score: float) -> Tuple[str, str]:
+    """0–100 スコアを 4 段階ラベル/色に変換"""
+    if score < 25:
+        return LABELS[0], COLORS[0]
+    if score < 50:
+        return LABELS[1], COLORS[1]
+    if score < 75:
+        return LABELS[2], COLORS[2]
+    return LABELS[3], COLORS[3]
+
+
+def compute_scores(img_bgr: np.ndarray, block: int, C: int, k: int):
+    clean_mask, labels, mean_size = preprocess(img_bgr, block, C, k)
+
+    with ThreadPoolExecutor() as ex:
+        f_dim_fut = ex.submit(fractal_dimension, clean_mask)
+        occ_fut = ex.submit(occupancy_rate, clean_mask)
+        hist_uni_fut = ex.submit(equalize_hist_uniformity, cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY))
+
+    fractal_dim, sizes, counts = f_dim_fut.result()
+    occ = occ_fut.result()
+    hist_uni = hist_uni_fut.result()
+
+    # 各指標を 0–100 にスケーリング (経験的範囲)
+    occ_s = np.clip(occ, 0, 20) * 5       # 0–20% → 0–100
+    size_s = np.clip(mean_size, 0, 200) / 200 * 100
+    fd_s = np.clip(fractal_dim, 1.0, 1.6) - 1.0
+    fd_s = fd_s / 0.6 * 100
+    hist_s = hist_uni * 100
+
+    # 等重み平均 (必要なら重み調整可)
+    total_score = np.mean([occ_s, size_s, fd_s, hist_s])
+    label, color = score_to_label(total_score)
+
+    return {
+        "mask": clean_mask,
+        "sizes": sizes,
+        "counts": counts,
+        "occ": occ,
+        "mean_size": mean_size,
+        "fd": fractal_dim,
+        "hist_uni": hist_uni,
+        "score": total_score,
+        "label": label,
+        "color": color,
+    }
+
+# ------------------------------ 4. Streamlit UI -------------------------------
 
 st.sidebar.header("⚙️ 前処理パラメータ")
-block = st.sidebar.slider("適応二値化ブロックサイズ", 5, 51, 11, 2)
-C_val = st.sidebar.slider("適応二値化定数 C", 0, 10, 2)
-kernel_sz = st.sidebar.slider("形態学カーネルサイズ", 1, 7, 3)
-apply_clahe = st.sidebar.checkbox("CLAHE (輝度強調)", True)
-gamma_val = st.sidebar.slider("ガンマ補正 γ", 0.4, 1.6, 0.8, 0.05)
+block = st.sidebar.slider("適応二値化ブロック", 5, 51, 11, 2)
+C_val = st.sidebar.slider("定数 C", 0, 10, 2)
+ksz = st.sidebar.slider("カーネルサイズ", 1, 7, 3)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 📤 画像アップロード")
-uploaded_file = st.sidebar.file_uploader("解析する画像を選択", type=["png", "jpg", "jpeg", "bmp"])
+uploaded = st.sidebar.file_uploader("画像を選択", ["jpg", "png", "jpeg", "bmp"])
 
-# メイン表示領域
-if uploaded_file is not None:
-    image_bytes = uploaded_file.read()
-    (
-        img_color,
-        edges_img,
-        occupancy,
-        cleanliness,
-        fractal_dim,
-        sat_mask,
-    ) = analyze_image(
-        image_bytes,
-        block,
-        C_val,
-        kernel_sz,
-        apply_clahe,
-        gamma_val,
-    )
+if uploaded:
+    img_bytes = uploaded.read()
+    img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+    img = resize_if_large(img)  # 速度対策
 
-    if img_color is None:
-        st.error("画像の解析に失敗しました。対応フォーマットか確認してください。")
-        st.stop()
+    result = compute_scores(img, block, C_val, ksz)
 
-    col1, col2 = st.columns(2)
+    # 1) サマリー
+    st.metric("総合スコア", f"{result['score']:.1f}/100")
+    st.markdown(f"<h3 style='color:{result['color']};'>{result['label']}</h3>", unsafe_allow_html=True)
 
-    # 画像表示
-    with col1:
-        st.subheader("📸 元画像 (カラー)")
-        st.image(cv2.cvtColor(img_color, cv2.COLOR_BGR2RGB), channels="RGB")
+    # 2) 指標カード
+    cols = st.columns(4)
+    cols[0].metric("空間占有率 %", f"{result['occ']:.2f}")
+    cols[1].metric("平均粒径 px", f"{result['mean_size']:.1f}")
+    cols[2].metric("フラクタル次元", f"{result['fd']:.3f}")
+    cols[3].metric("ヒスト均一度", f"{result['hist_uni']:.2f}")
 
-    with col2:
-        st.subheader("🧹 抽出エッジ")
-        st.image(edges_img, clamp=True)
+    # 3) レーダーチャート
+    with st.expander("▼ 詳細グラフ"):
+        indic_vals = [result['occ'], result['mean_size'], result['fd']*100, result['hist_uni']*100]
+        indic_names = ["占有率", "平均粒径", "FD×100", "ヒスト均一度×100"]
+        fig = go.Figure(go.Scatterpolar(r=indic_vals + [indic_vals[0]], theta=indic_names + [indic_names[0]], fill='toself'))
+        fig.update_layout(polar=dict(radialaxis=dict(visible=True)), showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
 
-    # 飽和率チェック
-    sat_rate = np.count_nonzero(sat_mask) / sat_mask.size * 100
-    if sat_rate > 5:
-        st.warning(f"白飛び領域が {sat_rate:.1f}% あります。露出を下げて再撮影すると精度向上します。")
+        # フラクタルプロット
+        fig2, ax2 = plt.subplots()
+        ax2.plot(np.log(result['sizes']), np.log(result['counts']), 'o-')
+        ax2.set_xlabel('log(Box Size)')
+        ax2.set_ylabel('log(Count)')
+        ax2.set_title(f"Fractal Dimension: {result['fd']:.3f}")
+        st.pyplot(fig2)
 
-    # ボックスカウントグラフ
-    st.subheader("📈 ボックスカウントグラフ")
-    min_exp = 1
-    max_exp = int(np.log2(min(edges_img.shape))) - 1
-    sizes = 2 ** np.arange(min_exp, max_exp)
-    counts = [box_count(edges_img, s) for s in sizes]
-
-    fig, ax = plt.subplots()
-    ax.plot(np.log(sizes), np.log(counts), "o-", label="Box Counting")
-    ax.set_xlabel("log(Box Size)")
-    ax.set_ylabel("log(Count)")
-    ax.set_title(f"Fractal Dimension: {fractal_dim:.4f}")
-    ax.legend()
-    st.pyplot(fig)
-
-    # テキスト結果
-    st.markdown(
-        f"**空間占有率:** {occupancy:.2f}%  ｜  **清潔度評価:** {cleanliness}  ｜  **フラクタル次元:** {fractal_dim:.4f}"
-    )
 else:
-    st.info("サイドバーから解析したい画像をアップロードしてください。")
+    st.info("サイドバーから画像をアップロードしてください。")
